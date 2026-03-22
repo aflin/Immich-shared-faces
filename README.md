@@ -6,7 +6,7 @@ person names, face bounding boxes, thumbnails, and search.
 
 ## Compatibility
 
-Tested against **Immich v2.5.6** only. Other versions may have different
+Tested against **Immich v2.5.6** and **v2.6.1**. Other versions may have different
 internal code and the patch may fail or behave unexpectedly.
 
 ## Usage

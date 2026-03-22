@@ -6,7 +6,7 @@
 # can see the album owner's facial recognition data (person names,
 # face bounding boxes, and person thumbnails).
 #
-# Tested against Immich v2.5.6. Will warn if a different version is detected.
+# Tested against Immich v2.5.6 and v2.6.1.
 #
 # Changes made:
 #   1. Backend: Don't strip people data from assets viewed by shared album members
@@ -28,7 +28,7 @@
 set -euo pipefail
 
 CONTAINER="${1:-immich_server}"
-EXPECTED_VERSION="2.5.6"
+TESTED_VERSIONS="2.5.6, 2.6.1"
 
 echo "=== Immich Shared Faces Patch ==="
 echo ""
@@ -39,26 +39,18 @@ if ! docker inspect --format='{{.State.Running}}' "$CONTAINER" 2>/dev/null | gre
     exit 1
 fi
 
-# Check version
+# Detect and display version
 VERSION=$(docker exec "$CONTAINER" curl -sf http://localhost:2283/api/server/version 2>/dev/null || echo "")
-if [ -z "$VERSION" ]; then
-    echo "WARNING: Could not determine Immich version. Proceeding anyway."
-elif echo "$VERSION" | python3 -c "
-import sys, json
-v = json.load(sys.stdin)
-print(f\"{v['major']}.{v['minor']}.{v['patch']}\")
-" 2>/dev/null | grep -qx "$EXPECTED_VERSION"; then
-    echo "Immich version $EXPECTED_VERSION detected. OK."
-else
+if [ -n "$VERSION" ]; then
     DETECTED=$(echo "$VERSION" | python3 -c "import sys,json; v=json.load(sys.stdin); print(f\"{v['major']}.{v['minor']}.{v['patch']}\")" 2>/dev/null || echo "unknown")
-    echo "WARNING: Expected Immich v$EXPECTED_VERSION but detected v$DETECTED."
-    echo "         This patch may not work correctly on this version."
-    read -p "         Continue anyway? [y/N] " -r
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "Aborted."
-        exit 1
-    fi
+    echo "Immich version $DETECTED detected."
+    echo "Tested versions: $TESTED_VERSIONS"
+else
+    DETECTED="unknown"
+    echo "WARNING: Could not determine Immich version."
 fi
+
+ERRORS=0
 
 echo ""
 
@@ -76,7 +68,8 @@ if docker exec "$CONTAINER" grep -q 'data.ownerId !== auth.user.id || auth.share
 elif docker exec "$CONTAINER" grep -q '// PATCHED: shared faces' "$ASSET_SERVICE"; then
     echo "  Already patched, skipping."
 else
-    echo "  WARNING: Expected pattern not found in asset.service.js. Skipping."
+    echo "  FAILED: Expected pattern not found in asset.service.js."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 2: Backend - person.service.js ---
@@ -97,83 +90,140 @@ if docker exec "$CONTAINER" grep -q 'async getThumbnail' "$PERSON_SERVICE" && \
 elif docker exec "$CONTAINER" grep -q 'getThumbnail.*// PATCHED' "$PERSON_SERVICE"; then
     echo "  Already patched, skipping."
 else
-    echo "  WARNING: Expected pattern not found in person.service.js. Skipping."
+    echo "  FAILED: Expected pattern not found in person.service.js."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 3: Frontend - detail panel chunk ---
 echo "Patch 3: Show people section for non-owners in shared albums..."
 
-# Find the chunk containing the isOwner gate for the people section.
-# We search for the pattern: !ti.isSharedLink&&h(f)&&ot(ut)
-# The chunk filename changes per version, so we find it dynamically.
-CHUNK_FILE=$(docker exec "$CONTAINER" grep -rl '!ti.isSharedLink&&h(f)&&ot(ut)' /build/www/_app/immutable/chunks/ 2>/dev/null || echo "")
+# Find the chunk containing viewPerson AND the isSharedLink people gate.
+# The minified variable names change per version, so we use regex matching.
+# Pattern structure: !<ns>.isSharedLink&&<isOwner>&&<render>(<renderFn>)
+# We need to remove the <isOwner>&& part.
+CHUNK_FILE=""
+PATCH3_NEEDED=""
+for f in $(docker exec "$CONTAINER" find /build/www/_app/immutable/chunks/ -name '*.js' 2>/dev/null); do
+    if docker exec "$CONTAINER" grep -q '\.viewPerson' "$f"; then
+        CHUNK_FILE="$f"
+        if docker exec "$CONTAINER" grep -Pq 'isSharedLink&&\w+\(\w+\)&&\w+\(\w+\)\}' "$f"; then
+            PATCH3_NEEDED="yes"
+        fi
+        break
+    fi
+done
 
-if [ -n "$CHUNK_FILE" ]; then
-    # Remove the h(f)&& (isOwner) check from the people section gate
-    docker exec "$CONTAINER" sed -i \
-        's/!ti.isSharedLink&&h(f)&&ot(ut)/!ti.isSharedLink\&\&ot(ut)/g' \
-        "$CHUNK_FILE"
-
-    # Delete precompressed versions so the modified file is served
-    docker exec "$CONTAINER" rm -f "${CHUNK_FILE}.br" "${CHUNK_FILE}.gz"
-
-    echo "  OK (patched $CHUNK_FILE)"
-elif docker exec "$CONTAINER" grep -rl '!ti.isSharedLink&&ot(ut)' /build/www/_app/immutable/chunks/ 2>/dev/null | grep -q .; then
+if [ -n "$CHUNK_FILE" ] && [ -n "$PATCH3_NEEDED" ]; then
+    # Extract the exact pattern: !XX.isSharedLink&&YY(ZZ)&&WW(VV)}
+    # and replace with: !XX.isSharedLink&&WW(VV)}
+    GATE_PATTERN=$(docker exec "$CONTAINER" grep -oP '!\w+\.isSharedLink&&\w+\(\w+\)&&\w+\(\w+\)\}' "$CHUNK_FILE" | head -1)
+    if [ -n "$GATE_PATTERN" ]; then
+        # Remove the isOwner check (middle &&term)
+        NEW_PATTERN=$(echo "$GATE_PATTERN" | sed -E 's/^(!\w+\.isSharedLink)&&\w+\(\w+\)(&&\w+\(\w+\)\})/\1\2/')
+        # Use perl with \Q..\E for literal matching (parens/dots are regex metacharacters)
+        docker exec "$CONTAINER" perl -i -pe "s/\\Q${GATE_PATTERN}\\E/${NEW_PATTERN}/g" "$CHUNK_FILE"
+        docker exec "$CONTAINER" rm -f "${CHUNK_FILE}.br" "${CHUNK_FILE}.gz"
+        echo "  OK (patched $CHUNK_FILE)"
+    else
+        echo "  FAILED: Could not extract gate pattern from chunk."
+        ERRORS=$((ERRORS + 1))
+    fi
+elif [ -n "$CHUNK_FILE" ]; then
     echo "  Already patched, skipping."
 else
-    echo "  WARNING: Could not find frontend chunk with expected pattern."
-    echo "           The minified variable names may differ in this version."
+    echo "  FAILED: Could not find frontend chunk with people section gate."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 4: Frontend - disable person link for non-owners ---
 echo "Patch 4: Make person links display-only for non-owners..."
 
-# The person link uses: ()=>sr.viewPerson(h(mt),{previousRoute:h(M)})
-# We wrap it so non-owners get "#" instead of a person page link.
-# This uses the same chunk file found in Patch 3.
-# If Patch 3 didn't find it, try to find it by the viewPerson pattern.
+# Pattern: ()=>XX.viewPerson(YY(ZZ),{previousRoute:YY(AA)})
+# Replace with: ()=>YY(ISOWNER)?XX.viewPerson(...):"#"
+# We need to extract the isOwner variable name from the gate pattern.
 if [ -z "$CHUNK_FILE" ]; then
-    CHUNK_FILE=$(docker exec "$CONTAINER" grep -rl 'sr.viewPerson' /build/www/_app/immutable/chunks/ 2>/dev/null | head -1 || echo "")
+    for f in $(docker exec "$CONTAINER" find /build/www/_app/immutable/chunks/ -name '*.js' 2>/dev/null); do
+        if docker exec "$CONTAINER" grep -q '\.viewPerson' "$f"; then
+            CHUNK_FILE="$f"
+            break
+        fi
+    done
 fi
 
-if [ -n "$CHUNK_FILE" ] && docker exec "$CONTAINER" grep -q '()=>sr.viewPerson(h(mt),{previousRoute:h(M)})' "$CHUNK_FILE"; then
-    docker exec "$CONTAINER" sed -i \
-        's/()=>sr.viewPerson(h(mt),{previousRoute:h(M)})/()=>h(f)?sr.viewPerson(h(mt),{previousRoute:h(M)}):"#"/g' \
-        "$CHUNK_FILE"
+if [ -n "$CHUNK_FILE" ] && \
+   docker exec "$CONTAINER" grep -Pq '\(\)=>\w+\.viewPerson\(' "$CHUNK_FILE" && \
+   ! docker exec "$CONTAINER" grep -Pq '\?\w+\.viewPerson\(' "$CHUNK_FILE"; then
 
-    # Delete precompressed versions if they were regenerated
-    docker exec "$CONTAINER" rm -f "${CHUNK_FILE}.br" "${CHUNK_FILE}.gz"
+    # Extract the isOwner variable: it's the function used in the people section gate
+    # Look for pattern: isSharedLink&&XX(YY) where XX(YY) is the isOwner call
+    ISOWNER_CALL=$(docker exec "$CONTAINER" grep -oP 'isSharedLink&&(\w+\(\w+\))' "$CHUNK_FILE" | head -1 | sed 's/isSharedLink&&//')
 
-    echo "  OK"
-elif [ -n "$CHUNK_FILE" ] && docker exec "$CONTAINER" grep -q 'h(f)?sr.viewPerson' "$CHUNK_FILE"; then
+    # Extract the full viewPerson expression
+    VP_EXPR=$(docker exec "$CONTAINER" grep -oP '\(\)=>\w+\.viewPerson\(\w+\(\w+\),\{previousRoute:\w+\(\w+\)\}\)' "$CHUNK_FILE" | head -1)
+
+    if [ -n "$VP_EXPR" ] && [ -n "$ISOWNER_CALL" ]; then
+        NEW_VP=$(echo "$VP_EXPR" | sed "s/()=>/()=>${ISOWNER_CALL}?/" | sed 's/$/:"\#"/')
+        docker exec "$CONTAINER" perl -i -pe "s/\\Q${VP_EXPR}\\E/${NEW_VP}/g" "$CHUNK_FILE"
+        docker exec "$CONTAINER" rm -f "${CHUNK_FILE}.br" "${CHUNK_FILE}.gz"
+        echo "  OK"
+    else
+        echo "  FAILED: Could not extract viewPerson or isOwner pattern."
+        ERRORS=$((ERRORS + 1))
+    fi
+elif [ -n "$CHUNK_FILE" ] && docker exec "$CONTAINER" grep -Pq '\?\w+\.viewPerson\(' "$CHUNK_FILE"; then
     echo "  Already patched, skipping."
 else
-    echo "  WARNING: Could not find viewPerson pattern in frontend chunk. Skipping."
+    echo "  FAILED: Could not find viewPerson pattern in frontend chunk."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 5: Frontend - hide edit buttons for non-owners ---
 echo "Patch 5: Hide face edit buttons for non-owners..."
 
-# The people section has a button container div (show hidden, +, pencil).
-# In minified code: var Pt=k(kt,2),Ot=b(Pt)
-# We insert a style.display="none" when not owner: if(!h(f))Pt.style.display="none"
+# The people section has a button container div after the faces list.
+# Pattern: var XX=A(YY,2),ZZ=S(XX) right after the people section gate.
+# We insert: if(!ISOWNER_CALL)XX.style.display="none";
 if [ -z "$CHUNK_FILE" ]; then
     CHUNK_FILE=$(docker exec "$CONTAINER" grep -rl 'show_hidden_people' /build/www/_app/immutable/chunks/ 2>/dev/null | head -1 || echo "")
 fi
 
-if [ -n "$CHUNK_FILE" ] && docker exec "$CONTAINER" grep -q 'var Pt=k(kt,2),Ot=b(Pt)' "$CHUNK_FILE"; then
-    docker exec "$CONTAINER" sed -i \
-        's/var Pt=k(kt,2),Ot=b(Pt)/var Pt=k(kt,2);if(!h(f))Pt.style.display="none";var Ot=b(Pt)/' \
-        "$CHUNK_FILE"
+# Extract isOwner call if not already set (may have been skipped by Patch 4)
+if [ -z "${ISOWNER_CALL:-}" ] && [ -n "$CHUNK_FILE" ]; then
+    # After Patch 3, the gate has two terms: isSharedLink&&WW(VV)
+    # Before Patch 3, it has three: isSharedLink&&XX(YY)&&WW(VV)
+    # Either way, the first call after isSharedLink&& in a three-term match is isOwner,
+    # or we look for the ternary we added in Patch 4: XX(YY)?...viewPerson
+    ISOWNER_CALL=$(docker exec "$CONTAINER" grep -oP '(\w+\(\w+\))\?\w+\.viewPerson' "$CHUNK_FILE" 2>/dev/null | head -1 | sed 's/?.*//')
+    if [ -z "$ISOWNER_CALL" ]; then
+        ISOWNER_CALL=$(docker exec "$CONTAINER" grep -oP 'isSharedLink&&(\w+\(\w+\))&&' "$CHUNK_FILE" 2>/dev/null | head -1 | sed 's/isSharedLink&&//;s/&&//')
+    fi
+fi
 
-    # Delete precompressed versions if they were regenerated
-    docker exec "$CONTAINER" rm -f "${CHUNK_FILE}.br" "${CHUNK_FILE}.gz"
-
-    echo "  OK"
-elif [ -n "$CHUNK_FILE" ] && docker exec "$CONTAINER" grep -q 'if(!h(f))Pt.style.display' "$CHUNK_FILE"; then
+if [ -n "$CHUNK_FILE" ] && docker exec "$CONTAINER" grep -q 'style.display="none"' "$CHUNK_FILE"; then
     echo "  Already patched, skipping."
+elif [ -n "$CHUNK_FILE" ] && [ -n "${ISOWNER_CALL:-}" ]; then
+    # Find the button container pattern near the people section.
+    # It follows the gate: }var XX=A|k(YY,2),ZZ=S|b(XX);{var ...
+    # The function names vary between versions (A/S in v2.6.1, k/b in v2.5.6).
+    BTN_PATTERN=$(docker exec "$CONTAINER" grep -oP '\}var \w+=\w+\(\w+,2\),\w+=\w+\(\w+\);\{var \w+=\w+=>' "$CHUNK_FILE" | head -1)
+    if [ -n "$BTN_PATTERN" ]; then
+        # Extract the variable name (first var after }) and the function names
+        BTN_VAR=$(echo "$BTN_PATTERN" | grep -oP '(?<=\}var )\w+')
+        # Extract the two function names used: var XX=FN1(YY,2),ZZ=FN2(XX)
+        FN1=$(echo "$BTN_PATTERN" | grep -oP "(?<=\}var ${BTN_VAR}=)\w+")
+        FN2=$(echo "$BTN_PATTERN" | grep -oP "\w+(?=\(${BTN_VAR}\))")
+        docker exec "$CONTAINER" perl -i -0777 -pe "
+            s/\\}var ${BTN_VAR}=(${FN1})\\((\\w+),2\\),(\\w+)=(${FN2})\\(${BTN_VAR}\\)/}var ${BTN_VAR}=\$1(\$2,2);if(!${ISOWNER_CALL})${BTN_VAR}.style.display=\"none\";var \$3=\$4(${BTN_VAR})/
+        " "$CHUNK_FILE"
+        docker exec "$CONTAINER" rm -f "${CHUNK_FILE}.br" "${CHUNK_FILE}.gz"
+        echo "  OK"
+    else
+        echo "  FAILED: Could not find button container pattern."
+        ERRORS=$((ERRORS + 1))
+    fi
 else
-    echo "  WARNING: Could not find button container pattern in frontend chunk. Skipping."
+    echo "  FAILED: Could not find frontend chunk or isOwner variable."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 6: Backend - make shared album people searchable ---
@@ -191,7 +241,8 @@ if docker exec "$CONTAINER" grep -q 'async searchPerson' "$SEARCH_SERVICE" && \
 elif docker exec "$CONTAINER" grep -q 'searchPerson.*// PATCHED' "$SEARCH_SERVICE"; then
     echo "  Already patched, skipping."
 else
-    echo "  WARNING: Expected pattern not found in search.service.js. Skipping."
+    echo "  FAILED: Expected pattern not found in search.service.js."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 7: Backend - include shared album people in People listing ---
@@ -208,13 +259,12 @@ if docker exec "$CONTAINER" grep -q 'getNumberOfPeople(auth.user.id);' "$PERSON_
 elif docker exec "$CONTAINER" grep -q 'PATCHED: shared faces - include people' "$PERSON_SERVICE"; then
     echo "  Already patched, skipping."
 else
-    echo "  WARNING: Expected pattern not found in person.service.js. Skipping."
+    echo "  FAILED: Expected pattern not found in person.service.js."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 9: Backend - include shared album owner assets in person search ---
 echo "Patch 9: Include shared album owner assets in person search results..."
-
-SEARCH_SERVICE="/usr/src/app/server/dist/services/search.service.js"
 
 # When searching by personId, the query only returns assets owned by the current user.
 # We need to also include assets owned by shared album owners so their photos appear.
@@ -227,7 +277,8 @@ if docker exec "$CONTAINER" grep -q 'getUserIdsToSearch(auth)' "$SEARCH_SERVICE"
 elif docker exec "$CONTAINER" grep -q 'PATCHED: shared faces - search' "$SEARCH_SERVICE"; then
     echo "  Already patched, skipping."
 else
-    echo "  WARNING: Expected pattern not found in search.service.js for metadata search. Skipping."
+    echo "  FAILED: Expected pattern not found in search.service.js for metadata search."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 10: Backend - allow viewing shared person detail pages ---
@@ -247,7 +298,8 @@ if docker exec "$CONTAINER" grep -q 'async getById(auth, id)' "$PERSON_SERVICE" 
 elif docker exec "$CONTAINER" grep -q 'getById.*// PATCHED' "$PERSON_SERVICE"; then
     echo "  Already patched (getById), skipping."
 else
-    echo "  WARNING: Expected pattern not found for getById. Skipping."
+    echo "  FAILED: Expected pattern not found for getById."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # 10b: Remove requireAccess from getStatistics in person.service.js
@@ -262,7 +314,8 @@ if docker exec "$CONTAINER" grep -q 'async getStatistics(auth, id)' "$PERSON_SER
 elif docker exec "$CONTAINER" grep -q 'getStatistics.*// PATCHED' "$PERSON_SERVICE"; then
     echo "  Already patched (getStatistics), skipping."
 else
-    echo "  WARNING: Expected pattern not found for getStatistics. Skipping."
+    echo "  FAILED: Expected pattern not found for getStatistics."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # 10c: Include shared album owner IDs in timeline queries when viewing a person
@@ -275,7 +328,8 @@ if docker exec "$CONTAINER" grep -q 'return { \.\.\.options, userIds };' "$TIMEL
 elif docker exec "$CONTAINER" grep -q 'PATCHED: shared faces' "$TIMELINE_SERVICE"; then
     echo "  Already patched (timeline), skipping."
 else
-    echo "  WARNING: Expected pattern not found in timeline.service.js. Skipping."
+    echo "  FAILED: Expected pattern not found in timeline.service.js."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Patch 8: Disable immutable caching for patched assets ---
@@ -291,7 +345,8 @@ if docker exec "$CONTAINER" grep -q "max-age=31536000,immutable" "$APP_COMMON"; 
 elif docker exec "$CONTAINER" grep -q "no-cache" "$APP_COMMON"; then
     echo "  Already patched, skipping."
 else
-    echo "  WARNING: Expected cache-control pattern not found. Skipping."
+    echo "  FAILED: Expected cache-control pattern not found."
+    ERRORS=$((ERRORS + 1))
 fi
 
 # --- Restart the server process ---
@@ -313,14 +368,17 @@ for i in $(seq 1 30); do
 done
 
 echo ""
-echo "=== Patch complete ==="
+if [ "$ERRORS" -gt 0 ]; then
+    echo "=== Patch completed with $ERRORS error(s) ==="
+    echo ""
+    echo "Some patches could not be applied. The backend code structure may"
+    echo "have changed in this version of Immich. Check the messages above."
+else
+    echo "=== All patches applied successfully ==="
+fi
 echo ""
 echo "Notes:"
 echo "  - These changes live inside the container and will be LOST on"
 echo "    'docker compose down' or 'docker compose pull'."
 echo "  - After updating Immich, re-run this script."
 echo "  - Users may need to clear browser cache to see the frontend change."
-echo "  - A HARD REFRESH MAY NOT BE SUFFICIENT.  Clear site data if necessary."
-echo "  - For the frontend patch, the minified variable names may change"
-echo "    between Immich versions. If Patch 3 warns, the script needs"
-echo "    updating for the new version."
