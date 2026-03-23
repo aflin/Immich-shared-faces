@@ -118,6 +118,8 @@ if [ -n "$CHUNK_FILE" ] && [ -n "$PATCH3_NEEDED" ]; then
     # and replace with: !XX.isSharedLink&&WW(VV)}
     GATE_PATTERN=$(docker exec "$CONTAINER" grep -oP '!\w+\.isSharedLink&&\w+\(\w+\)&&\w+\(\w+\)\}' "$CHUNK_FILE" | head -1)
     if [ -n "$GATE_PATTERN" ]; then
+        # Extract the isOwner call (middle term) BEFORE removing it — needed by Patches 4 & 5
+        ISOWNER_CALL=$(echo "$GATE_PATTERN" | grep -oP '(?<=isSharedLink&&)\w+\(\w+\)(?=&&)')
         # Remove the isOwner check (middle &&term)
         NEW_PATTERN=$(echo "$GATE_PATTERN" | sed -E 's/^(!\w+\.isSharedLink)&&\w+\(\w+\)(&&\w+\(\w+\)\})/\1\2/')
         # Use perl with \Q..\E for literal matching (parens/dots are regex metacharacters)
@@ -154,9 +156,14 @@ if [ -n "$CHUNK_FILE" ] && \
    docker exec "$CONTAINER" grep -Pq '\(\)=>\w+\.viewPerson\(' "$CHUNK_FILE" && \
    ! docker exec "$CONTAINER" grep -Pq '\?\w+\.viewPerson\(' "$CHUNK_FILE"; then
 
-    # Extract the isOwner variable: it's the function used in the people section gate
-    # Look for pattern: isSharedLink&&XX(YY) where XX(YY) is the isOwner call
-    ISOWNER_CALL=$(docker exec "$CONTAINER" grep -oP 'isSharedLink&&(\w+\(\w+\))' "$CHUNK_FILE" | head -1 | sed 's/isSharedLink&&//')
+    # ISOWNER_CALL was extracted from the three-term gate in Patch 3.
+    # If Patch 3 was already applied (skipped), extract from ownerId definition.
+    if [ -z "${ISOWNER_CALL:-}" ]; then
+        OWNER_VAR=$(docker exec "$CONTAINER" grep -oP '(\w+)=y\(\(\)=>e\(\)\?\.id===\w+\(\)\.ownerId\)' "$CHUNK_FILE" | head -1 | sed 's/=.*//')
+        if [ -n "$OWNER_VAR" ]; then
+            ISOWNER_CALL="c(${OWNER_VAR})"
+        fi
+    fi
 
     # Extract the full viewPerson expression
     VP_EXPR=$(docker exec "$CONTAINER" grep -oP '\(\)=>\w+\.viewPerson\(\w+\(\w+\),\{previousRoute:\w+\(\w+\)\}\)' "$CHUNK_FILE" | head -1)
@@ -187,33 +194,34 @@ if [ -z "$CHUNK_FILE" ]; then
     CHUNK_FILE=$(docker exec "$CONTAINER" grep -rl 'show_hidden_people' /build/www/_app/immutable/chunks/ 2>/dev/null | head -1 || echo "")
 fi
 
-# Extract isOwner call if not already set (may have been skipped by Patch 4)
+# Extract isOwner call if not already set (may have been skipped by Patches 3 & 4)
 if [ -z "${ISOWNER_CALL:-}" ] && [ -n "$CHUNK_FILE" ]; then
-    # After Patch 3, the gate has two terms: isSharedLink&&WW(VV)
-    # Before Patch 3, it has three: isSharedLink&&XX(YY)&&WW(VV)
-    # Either way, the first call after isSharedLink&& in a three-term match is isOwner,
-    # or we look for the ternary we added in Patch 4: XX(YY)?...viewPerson
+    # Try the ternary from Patch 4
     ISOWNER_CALL=$(docker exec "$CONTAINER" grep -oP '(\w+\(\w+\))\?\w+\.viewPerson' "$CHUNK_FILE" 2>/dev/null | head -1 | sed 's/?.*//')
+    # Fall back to ownerId definition
     if [ -z "$ISOWNER_CALL" ]; then
-        ISOWNER_CALL=$(docker exec "$CONTAINER" grep -oP 'isSharedLink&&(\w+\(\w+\))&&' "$CHUNK_FILE" 2>/dev/null | head -1 | sed 's/isSharedLink&&//;s/&&//')
+        OWNER_VAR=$(docker exec "$CONTAINER" grep -oP '(\w+)=y\(\(\)=>e\(\)\?\.id===\w+\(\)\.ownerId\)' "$CHUNK_FILE" 2>/dev/null | head -1 | sed 's/=.*//')
+        if [ -n "$OWNER_VAR" ]; then
+            ISOWNER_CALL="c(${OWNER_VAR})"
+        fi
     fi
 fi
 
 if [ -n "$CHUNK_FILE" ] && docker exec "$CONTAINER" grep -q 'style.display="none"' "$CHUNK_FILE"; then
     echo "  Already patched, skipping."
 elif [ -n "$CHUNK_FILE" ] && [ -n "${ISOWNER_CALL:-}" ]; then
-    # Find the button container pattern near the people section.
-    # It follows the gate: }var XX=A|k(YY,2),ZZ=S|b(XX);{var ...
-    # The function names vary between versions (A/S in v2.6.1, k/b in v2.5.6).
-    BTN_PATTERN=$(docker exec "$CONTAINER" grep -oP '\}var \w+=\w+\(\w+,2\),\w+=\w+\(\w+\);\{var \w+=\w+=>' "$CHUNK_FILE" | head -1)
+    # Find the button container that follows the people section gate specifically.
+    # Anchor to isSharedLink gate (handles both patched 2-term and unpatched 3-term):
+    #   isSharedLink&&[...]})}var XX=fn(YY,2),ZZ=fn(XX)
+    BTN_PATTERN=$(docker exec "$CONTAINER" grep -oP 'isSharedLink&&(?:\w+\(\w+\)&&)?\w+\(\w+\)\}\)\}var \w+=\w+\(\w+,2\),\w+=\w+\(\w+\)' "$CHUNK_FILE" | head -1 | grep -oP 'var \w+=\w+\(\w+,2\),\w+=\w+\(\w+\)')
     if [ -n "$BTN_PATTERN" ]; then
-        # Extract the variable name (first var after }) and the function names
-        BTN_VAR=$(echo "$BTN_PATTERN" | grep -oP '(?<=\}var )\w+')
+        # Extract the variable name and the function names from: var XX=FN1(YY,2),ZZ=FN2(XX)
+        BTN_VAR=$(echo "$BTN_PATTERN" | grep -oP '(?<=var )\w+')
         # Extract the two function names used: var XX=FN1(YY,2),ZZ=FN2(XX)
-        FN1=$(echo "$BTN_PATTERN" | grep -oP "(?<=\}var ${BTN_VAR}=)\w+")
+        FN1=$(echo "$BTN_PATTERN" | grep -oP "(?<=var ${BTN_VAR}=)\w+")
         FN2=$(echo "$BTN_PATTERN" | grep -oP "\w+(?=\(${BTN_VAR}\))")
         docker exec "$CONTAINER" perl -i -0777 -pe "
-            s/\\}var ${BTN_VAR}=(${FN1})\\((\\w+),2\\),(\\w+)=(${FN2})\\(${BTN_VAR}\\)/}var ${BTN_VAR}=\$1(\$2,2);if(!${ISOWNER_CALL})${BTN_VAR}.style.display=\"none\";var \$3=\$4(${BTN_VAR})/
+            s/var ${BTN_VAR}=(${FN1})\\((\\w+),2\\),(\\w+)=(${FN2})\\(${BTN_VAR}\\)/var ${BTN_VAR}=\$1(\$2,2);if(!${ISOWNER_CALL})${BTN_VAR}.style.display=\"none\";var \$3=\$4(${BTN_VAR})/
         " "$CHUNK_FILE"
         docker exec "$CONTAINER" rm -f "${CHUNK_FILE}.br" "${CHUNK_FILE}.gz"
         echo "  OK"
